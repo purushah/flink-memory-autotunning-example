@@ -60,34 +60,38 @@ import java.util.Random;
  *   job.autoscaler.memory.tuning.enabled: true
  *   job.autoscaler.scaling.enabled: true
  */
-public class MemoryAutotuningJob {
-
-    private static final Logger LOG = LoggerFactory.getLogger(MemoryAutotuningJob.class);
-
     // Load pattern configuration
     private static final long HIGH_LOAD_RATE = 100_000; // events/sec - triggers scale up
     private static final long LOW_LOAD_RATE = 500;      // events/sec - triggers scale down
-    private static final long LOAD_CYCLE_DURATION_MS = 10 * 60 * 1000; // 10 minutes per phase
-    private static final int USER_COUNT = 10_000; // More users = more state
-
+    private static final long LOAD_CYCLE_DURATION_MS = 10L * 60 * 1000; // 10 minutes per phase; use long literal to avoid int overflow
+    static final int USER_COUNT = 10_000; // More users = more state; package-visible for use in VariableLoadGenerator
     public static void main(String[] args) throws Exception {
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-
+    private static final long LOAD_CYCLE_DURATION_MS = 10 * 60 * 1000; // 10 minutes per phase
+    private static final int USER_COUNT = 10_000; // More users = more state
         // Enable checkpointing for stateful operations
         env.enableCheckpointing(60000); // Checkpoint every 60 seconds
-
-        // High default parallelism to trigger more TaskManagers under load
-        // The autoscaler will adjust this based on actual load
-        env.setParallelism(50);
-
+        // Default parallelism left at 1; each operator sets its own parallelism explicitly.
+        // A global override of 50 is misleading when every vertex overrides it anyway,
+        // and it causes unintended parallelism on operators that don't set it (e.g., sinks).
+        // Let the autoscaler manage scaling from the per-operator settings below.
         LOG.info("=================================================================");
         LOG.info("Starting Variable Load Job for Autoscaling Demonstration");
         LOG.info("HIGH LOAD: {} events/sec (scales up to 20-30 TaskManagers)", HIGH_LOAD_RATE);
         LOG.info("LOW LOAD: {} events/sec (scales down to 2-3 TaskManagers)", LOW_LOAD_RATE);
-        LOG.info("Load cycle duration: {} minutes", LOAD_CYCLE_DURATION_MS / 60000);
+        LOG.info("Load cycle duration: {} minutes", LOAD_CYCLE_DURATION_MS / 60_000L);
         LOG.info("=================================================================");
-
-        // Generate random events with VARIABLE rates that cycle over time
+        // Generate random events.
+        // NOTE: RateLimiterStrategy is fixed at source construction time; dynamic rate
+        // variation must be implemented inside VariableLoadGenerator by sleeping/yielding,
+        // not by changing the RateLimiterStrategy after construction.
+        DataGeneratorSource<Event> source = new DataGeneratorSource<>(
+            new VariableLoadGenerator(),
+            Long.MAX_VALUE,                                   // Generate unlimited events (intentional)
+            RateLimiterStrategy.perSecond(HIGH_LOAD_RATE),   // Hard cap at high-load rate; variable
+                                                              // pacing is controlled inside the generator
+            TypeInformation.of(Event.class)
+        );
         DataGeneratorSource<Event> source = new DataGeneratorSource<>(
             new VariableLoadGenerator(),
             Long.MAX_VALUE, // Generate unlimited events
@@ -96,23 +100,24 @@ public class MemoryAutotuningJob {
         );
 
         DataStream<Event> events = env.fromSource(
-            source,
-            WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
-                .withTimestampAssigner((event, timestamp) -> event.timestamp),
-            "VariableLoadEventSource"
-        ).setParallelism(20); // High parallelism for source
-
-        // Vertex 1: Stateful enrichment - maintains state for each user
-        // HIGH PARALLELISM to utilize many TaskManagers
+        );
+        // Vertex 1: Stateful enrichment — maintains keyed state per user.
+        // Parallelism must be <= source parallelism * shuffle factor; 20 matches source.
+        // Increasing beyond the number of distinct keys (USER_COUNT) yields no benefit.
         DataStream<EnrichedEvent> enriched = events
             .keyBy(event -> event.userId)
-            .map(new StatefulEnrichmentFunction())
+            .process(new StatefulEnrichmentFunction())   // KeyedProcessFunction gives access to keyed state correctly typed
             .name("StatefulEnrichment")
-            .setParallelism(80); // Very high parallelism
-
-        // Vertex 2: CPU-intensive processing to create backpressure
+            .setParallelism(20); // Match source parallelism; autoscaler will tune upward if needed
+        // Vertex 2: CPU-intensive processing
         DataStream<EnrichedEvent> processed = enriched
             .map(new CpuIntensiveFunction())
+            .name("CpuIntensiveProcessing")
+            .setParallelism(20); // Keep consistent; autoscaler will adjust
+        // Vertex 3: Windowed aggregation - memory-intensive windowing
+        DataStream<AggregatedStats> windowed = processed
+            .keyBy(event -> event.userId)
+            .window(TumblingEventTimeWindows.of(Duration.ofMinutes(
             .name("CpuIntensiveProcessing")
             .setParallelism(60);
 
