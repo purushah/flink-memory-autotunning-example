@@ -20,7 +20,7 @@ package com.yahoo.flink.memory;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.RichMapFunction;
-import org.apache.flink.configuration.Configuration;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.state.MapState;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
@@ -28,7 +28,9 @@ import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.source.util.ratelimit.RateLimiterStrategy;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.datagen.source.DataGeneratorSource;
+import org.apache.flink.connector.datagen.source.GeneratorFunction;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
@@ -39,381 +41,422 @@ import org.apache.flink.util.Collector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Serializable;
 import java.time.Duration;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 
 /**
  * Flink job demonstrating memory autotuning and autoscaling with Kubernetes Operator.
  *
- * This job creates multiple vertices with memory-intensive operations and variable load:
- * 1. Random data generation with VARIABLE RATES (cycles every 10 minutes)
- *    - HIGH LOAD: 100,000 events/sec → triggers scale-up to 20-30 TaskManagers
- *    - LOW LOAD: 500 events/sec → triggers scale-down to 2-3 TaskManagers
- * 2. Stateful enrichment operator with high parallelism
- * 3. Windowed aggregation operator
- * 4. Memory-intensive state accumulation operator
+ * <p>This job creates multiple vertices with memory-intensive operations and variable load:
+ * <ol>
+ *   <li>Random data generation at a configurable rate</li>
+ *   <li>Stateful enrichment operator using keyed state (ValueState + MapState)</li>
+ *   <li>CPU-intensive processing to simulate real workloads</li>
+ *   <li>Windowed aggregation operator (TumblingEventTimeWindows)</li>
+ *   <li>Memory-intensive state accumulation operator</li>
+ * </ol>
  *
- * To enable autotuning in Kubernetes, configure FlinkDeployment with:
- *   job.autoscaler.enabled: true
- *   job.autoscaler.memory.tuning.enabled: true
- *   job.autoscaler.scaling.enabled: true
+ * <p>To enable autotuning in Kubernetes, configure FlinkDeployment with:
+ * <pre>
+ *   job.autoscaler.enabled: "true"
+ *   job.autoscaler.memory.tuning.enabled: "true"
+ *   job.autoscaler.scaling.enabled: "true"
+ * </pre>
+ *
+ * <p>Load rates can be controlled via the following environment variables (events/sec):
+ * <ul>
+ *   <li>{@code SOURCE_RATE_PER_SEC} – default {@value MemoryAutotuningJob#DEFAULT_SOURCE_RATE}</li>
+ * </ul>
  */
 public class MemoryAutotuningJob {
 
     private static final Logger LOG = LoggerFactory.getLogger(MemoryAutotuningJob.class);
 
-    // Load pattern configuration
-    private static final long HIGH_LOAD_RATE = 100_000; // events/sec - triggers scale up
-    private static final long LOW_LOAD_RATE = 500;      // events/sec - triggers scale down
-    private static final long LOAD_CYCLE_DURATION_MS = 10 * 60 * 1000; // 10 minutes per phase
-    private static final int USER_COUNT = 10_000; // More users = more state
+    // ---------- tuneable constants ----------
+    /** Default source rate (events / second). Override via env var SOURCE_RATE_PER_SEC. */
+    static final long DEFAULT_SOURCE_RATE = 10_000L;
+
+    /** Number of distinct user keys – controls state fan-out. */
+    static final int USER_COUNT = 10_000;
+
+    /** Number of attribute entries stored per user in MapState. */
+    static final int ATTRIBUTES_PER_USER = 20;
+
+    // ----------------------------------------
 
     public static void main(String[] args) throws Exception {
-        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
-        // Enable checkpointing for stateful operations
-        env.enableCheckpointing(60000); // Checkpoint every 60 seconds
+        final long sourceRate = parseSourceRate();
 
-        // High default parallelism to trigger more TaskManagers under load
-        // The autoscaler will adjust this based on actual load
-        env.setParallelism(50);
+        final StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Enable checkpointing so that state backends are actually exercised.
+        env.enableCheckpointing(60_000L); // every 60 s
+
+        // Keep default parallelism low; let the autoscaler drive it up/down.
+        env.setParallelism(4);
 
         LOG.info("=================================================================");
-        LOG.info("Starting Variable Load Job for Autoscaling Demonstration");
-        LOG.info("HIGH LOAD: {} events/sec (scales up to 20-30 TaskManagers)", HIGH_LOAD_RATE);
-        LOG.info("LOW LOAD: {} events/sec (scales down to 2-3 TaskManagers)", LOW_LOAD_RATE);
-        LOG.info("Load cycle duration: {} minutes", LOAD_CYCLE_DURATION_MS / 60000);
+        LOG.info("Starting MemoryAutotuningJob");
+        LOG.info("Source rate : {} events/sec", sourceRate);
+        LOG.info("User count  : {}", USER_COUNT);
         LOG.info("=================================================================");
 
-        // Generate random events with VARIABLE rates that cycle over time
+        // ── Source ────────────────────────────────────────────────────────────
         DataGeneratorSource<Event> source = new DataGeneratorSource<>(
-            new VariableLoadGenerator(),
-            Long.MAX_VALUE, // Generate unlimited events
-            RateLimiterStrategy.perSecond(HIGH_LOAD_RATE), // Start with high load
-            TypeInformation.of(Event.class)
-        );
+                new EventGeneratorFunction(),
+                Long.MAX_VALUE,
+                RateLimiterStrategy.perSecond(sourceRate),
+                TypeInformation.of(Event.class));
 
-        DataStream<Event> events = env.fromSource(
-            source,
-            WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
-                .withTimestampAssigner((event, timestamp) -> event.timestamp),
-            "VariableLoadEventSource"
-        ).setParallelism(20); // High parallelism for source
+        DataStream<Event> events = env
+                .fromSource(
+                        source,
+                        WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+                                .withTimestampAssigner((event, ts) -> event.timestamp),
+                        "EventSource")
+                .setParallelism(2);
 
-        // Vertex 1: Stateful enrichment - maintains state for each user
-        // HIGH PARALLELISM to utilize many TaskManagers
+        // ── Vertex 1 : Stateful enrichment ────────────────────────────────────
+        // keyBy is required so that keyed state (ValueState / MapState) is valid.
         DataStream<EnrichedEvent> enriched = events
-            .keyBy(event -> event.userId)
-            .map(new StatefulEnrichmentFunction())
-            .name("StatefulEnrichment")
-            .setParallelism(80); // Very high parallelism
+                .keyBy(event -> event.userId)
+                .process(new StatefulEnrichmentFunction())
+                .name("StatefulEnrichment")
+                .setParallelism(4);
 
-        // Vertex 2: CPU-intensive processing to create backpressure
+        // ── Vertex 2 : CPU-intensive processing ───────────────────────────────
         DataStream<EnrichedEvent> processed = enriched
-            .map(new CpuIntensiveFunction())
-            .name("CpuIntensiveProcessing")
-            .setParallelism(60);
+                .map(new CpuIntensiveFunction())
+                .name("CpuIntensiveProcessing")
+                .setParallelism(4);
 
-        // Vertex 3: Windowed aggregation - memory-intensive windowing
+        // ── Vertex 3 : Windowed aggregation ───────────────────────────────────
         DataStream<AggregatedStats> windowed = processed
-            .keyBy(event -> event.userId)
-            .window(TumblingEventTimeWindows.of(Duration.ofMinutes(3)))
-            .process(new WindowedAggregationFunction())
-            .name("WindowedAggregation")
-            .setParallelism(40);
+                .keyBy(e -> e.userId)
+                .window(TumblingEventTimeWindows.of(Duration.ofMinutes(1)))
+                .process(new WindowAggregationFunction())
+                .name("WindowedAggregation")
+                .setParallelism(4);
 
-        // Vertex 4: State accumulation - grows state over time
-        DataStream<UserProfile> profiles = windowed
-            .keyBy(stats -> stats.userId)
-            .process(new StateAccumulationFunction())
-            .name("StateAccumulation")
-            .setParallelism(30);
+        // ── Vertex 4 : Memory-intensive state accumulation ────────────────────
+        windowed
+                .keyBy(s -> s.userId)
+                .process(new MemoryIntensiveAccumulatorFunction())
+                .name("MemoryIntensiveAccumulator")
+                .setParallelism(4)
+                .print()
+                .name("Sink");
 
-        // Vertex 5: Final processing and sink
-        profiles
-            .map(new FinalProcessingFunction())
-            .name("FinalProcessing")
-            .setParallelism(10)
-            .print()
-            .name("ConsoleSink");
-
-        LOG.info("Starting Flink Memory Autotuning and Autoscaling Example Job");
-        LOG.info("This job demonstrates variable load for autoscaling demonstration");
-
-        env.execute("Flink Memory Autotuning and Autoscaling Example");
+        env.execute("MemoryAutotuningJob");
     }
 
-    /**
-     * Variable load generator that cycles between high and low rates.
-     * This simulates real-world traffic patterns and demonstrates autoscaling.
-     */
-    public static class VariableLoadGenerator implements org.apache.flink.connector.datagen.source.GeneratorFunction<Long, Event> {
-        private final Random random = new Random();
-        private long startTime = 0;
+    // ── Helper ────────────────────────────────────────────────────────────────
 
-        @Override
-        public Event map(Long index) {
-            if (startTime == 0) {
-                startTime = System.currentTimeMillis();
+    private static long parseSourceRate() {
+        String env = System.getenv("SOURCE_RATE_PER_SEC");
+        if (env != null && !env.isEmpty()) {
+            try {
+                long rate = Long.parseLong(env.trim());
+                if (rate > 0) {
+                    return rate;
+                }
+                LOG.warn("SOURCE_RATE_PER_SEC must be positive, using default {}", DEFAULT_SOURCE_RATE);
+            } catch (NumberFormatException e) {
+                LOG.warn("Cannot parse SOURCE_RATE_PER_SEC='{}', using default {}", env, DEFAULT_SOURCE_RATE);
             }
-
-            long elapsed = System.currentTimeMillis() - startTime;
-            long cyclePosition = elapsed % (LOAD_CYCLE_DURATION_MS * 2); // Full cycle = high + low
-
-            // Determine if we're in high or low load phase
-            boolean isHighLoad = cyclePosition < LOAD_CYCLE_DURATION_MS;
-
-            // Log phase transitions (every 30 seconds)
-            if (index % 30000 == 0) {
-                String phase = isHighLoad ? "HIGH LOAD" : "LOW LOAD";
-                long rate = isHighLoad ? HIGH_LOAD_RATE : LOW_LOAD_RATE;
-                long minutesInPhase = (cyclePosition % LOAD_CYCLE_DURATION_MS) / 60000;
-                LOG.info(">>> LOAD PATTERN: {} - {} events/sec - {} min into phase",
-                    phase, rate, minutesInPhase);
-            }
-
-            // Generate event
-            String userId = "user_" + (random.nextInt(USER_COUNT) + 1);
-            String eventType = random.nextBoolean() ? "CLICK" : "PURCHASE";
-            double amount = random.nextDouble() * 1000;
-            long timestamp = System.currentTimeMillis();
-
-            return new Event(userId, eventType, amount, timestamp);
         }
+        return DEFAULT_SOURCE_RATE;
     }
 
-    /**
-     * CPU-intensive function to create computational load.
-     * This helps trigger CPU-based autoscaling.
-     */
-    public static class CpuIntensiveFunction extends RichMapFunction<EnrichedEvent, EnrichedEvent> {
-        @Override
-        public EnrichedEvent map(EnrichedEvent event) throws Exception {
-            // Simulate CPU-intensive computation
-            // Calculate some expensive operations to add CPU load
-            double result = 0;
-            for (int i = 0; i < 100; i++) {
-                result += Math.sqrt(event.amount * i) + Math.log(i + 1);
-                result = Math.sin(result) * Math.cos(result);
-            }
+    // =========================================================================
+    // Data model
+    // =========================================================================
 
-            // Just to use the result and prevent optimization
-            event.totalAmount += result * 0.000001;
+    /** Raw event emitted by the source. */
+    public static class Event implements Serializable {
+        private static final long serialVersionUID = 1L;
 
-            return event;
-        }
-    }
-
-    // Data classes
-    public static class Event {
         public String userId;
-        public String eventType;
-        public double amount;
-        public long timestamp;
+        public long   timestamp;
+        public double value;
+        public String category;
 
         public Event() {}
 
-        public Event(String userId, String eventType, double amount, long timestamp) {
-            this.userId = userId;
-            this.eventType = eventType;
-            this.amount = amount;
+        public Event(String userId, long timestamp, double value, String category) {
+            this.userId    = userId;
             this.timestamp = timestamp;
+            this.value     = value;
+            this.category  = category;
         }
 
         @Override
         public String toString() {
-            return String.format("Event{user=%s, type=%s, amount=%.2f, ts=%d}",
-                userId, eventType, amount, timestamp);
+            return "Event{userId='" + userId + "', ts=" + timestamp
+                    + ", value=" + value + ", category='" + category + "'}";
         }
     }
 
-    public static class EnrichedEvent {
+    /** Event enriched with per-user state. */
+    public static class EnrichedEvent implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         public String userId;
-        public String eventType;
-        public double amount;
-        public long timestamp;
-        public long eventCount;
-        public double totalAmount;
+        public long   timestamp;
+        public double value;
+        public String category;
+        public long   eventCount;       // running count for this user
+        public double runningAverage;   // running average value for this user
+        public String enrichmentTag;    // extra string data to increase memory pressure
 
         public EnrichedEvent() {}
 
         @Override
         public String toString() {
-            return String.format("EnrichedEvent{user=%s, type=%s, amount=%.2f, count=%d, total=%.2f}",
-                userId, eventType, amount, eventCount, totalAmount);
+            return "EnrichedEvent{userId='" + userId + "', count=" + eventCount
+                    + ", avg=" + runningAverage + '}';
         }
     }
 
-    public static class AggregatedStats {
+    /** Per-window aggregation result. */
+    public static class AggregatedStats implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         public String userId;
-        public long eventCount;
-        public double totalAmount;
-        public double avgAmount;
-        public long windowStart;
-        public long windowEnd;
+        public long   windowStart;
+        public long   windowEnd;
+        public long   count;
+        public double sum;
+        public double min;
+        public double max;
 
         public AggregatedStats() {}
 
         @Override
         public String toString() {
-            return String.format("AggregatedStats{user=%s, count=%d, total=%.2f, avg=%.2f, window=%d-%d}",
-                userId, eventCount, totalAmount, avgAmount, windowStart, windowEnd);
+            return "AggregatedStats{userId='" + userId + "', window=[" + windowStart
+                    + "," + windowEnd + "), count=" + count + ", sum=" + sum + '}';
         }
     }
 
-    public static class UserProfile {
-        public String userId;
-        public long totalEvents;
-        public double lifetimeValue;
-        public Map<String, Long> eventTypeCounts;
+    // =========================================================================
+    // Operator implementations
+    // =========================================================================
 
-        public UserProfile() {
-            this.eventTypeCounts = new HashMap<>();
-        }
+    /**
+     * Generates {@link Event} instances with a uniformly random userId chosen from
+     * {@code [user-0, user-(USER_COUNT-1)]}.
+     */
+    public static class EventGeneratorFunction
+            implements GeneratorFunction<Long, Event>, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private static final String[] CATEGORIES = {"A", "B", "C", "D", "E"};
+
+        // Lazily initialised; Random is not serializable so we create it on first use.
+        private transient Random random;
 
         @Override
-        public String toString() {
-            return String.format("UserProfile{user=%s, events=%d, ltv=%.2f, types=%s}",
-                userId, totalEvents, lifetimeValue, eventTypeCounts);
+        public Event map(Long index) {
+            if (random == null) {
+                random = new Random();
+            }
+            String userId   = "user-" + random.nextInt(USER_COUNT);
+            long   ts       = System.currentTimeMillis();
+            double value    = random.nextDouble() * 1_000.0;
+            String category = CATEGORIES[random.nextInt(CATEGORIES.length)];
+            return new Event(userId, ts, value, category);
         }
     }
 
-    // Operator 1: Stateful enrichment - maintains per-user counters
-    public static class StatefulEnrichmentFunction extends RichMapFunction<Event, EnrichedEvent> {
-        private transient ValueState<Long> eventCountState;
-        private transient ValueState<Double> totalAmountState;
+    /**
+     * Stateful enrichment that tracks per-user event count and running average using
+     * {@link ValueState} and {@link MapState}.
+     *
+     * <p>Must be used on a <em>keyed</em> stream – here keyed by {@code userId}.
+     */
+    public static class StatefulEnrichmentFunction
+            extends KeyedProcessFunction<String, Event, EnrichedEvent> {
+
+        private static final long serialVersionUID = 1L;
+
+        // Running count and sum for computing the average
+        private transient ValueState<Long>   countState;
+        private transient ValueState<Double> sumState;
+
+        // Attribute map – simulates enrichment look-up data stored in state
+        private transient MapState<String, String> attributeState;
 
         @Override
         public void open(Configuration parameters) throws Exception {
-            eventCountState = getRuntimeContext().getState(
-                new ValueStateDescriptor<>("eventCount", Long.class)
-            );
-            totalAmountState = getRuntimeContext().getState(
-                new ValueStateDescriptor<>("totalAmount", Double.class)
-            );
+            countState = getRuntimeContext().getState(
+                    new ValueStateDescriptor<>("event-count", Long.class));
+
+            sumState = getRuntimeContext().getState(
+                    new ValueStateDescriptor<>("value-sum", Double.class));
+
+            attributeState = getRuntimeContext().getMapState(
+                    new MapStateDescriptor<>("user-attributes", String.class, String.class));
         }
 
         @Override
-        public EnrichedEvent map(Event event) throws Exception {
-            Long currentCount = eventCountState.value();
-            Double currentTotal = totalAmountState.value();
+        public void processElement(Event event, Context ctx, Collector<EnrichedEvent> out)
+                throws Exception {
 
-            long newCount = (currentCount == null ? 0 : currentCount) + 1;
-            double newTotal = (currentTotal == null ? 0 : currentTotal) + event.amount;
+            // ── update count ──────────────────────────────────────────────────
+            Long count = countState.value();
+            if (count == null) count = 0L;
+            count++;
+            countState.update(count);
 
-            eventCountState.update(newCount);
-            totalAmountState.update(newTotal);
+            // ── update running sum ────────────────────────────────────────────
+            Double sum = sumState.value();
+            if (sum == null) sum = 0.0;
+            sum += event.value;
+            sumState.update(sum);
 
+            // ── populate attribute map (lazy initialisation) ──────────────────
+            // We only write attributes once per user to avoid unbounded growth
+            // while still exercising MapState memory pressure.
+            if (count == 1L) {
+                for (int i = 0; i < ATTRIBUTES_PER_USER; i++) {
+                    attributeState.put("attr-" + i, event.userId + "-val-" + i);
+                }
+            }
+
+            // ── build enriched event ──────────────────────────────────────────
             EnrichedEvent enriched = new EnrichedEvent();
-            enriched.userId = event.userId;
-            enriched.eventType = event.eventType;
-            enriched.amount = event.amount;
-            enriched.timestamp = event.timestamp;
-            enriched.eventCount = newCount;
-            enriched.totalAmount = newTotal;
+            enriched.userId         = event.userId;
+            enriched.timestamp      = event.timestamp;
+            enriched.value          = event.value;
+            enriched.category       = event.category;
+            enriched.eventCount     = count;
+            enriched.runningAverage = sum / count;
+            enriched.enrichmentTag  = attributeState.get("attr-0"); // read one entry
 
-            return enriched;
+            out.collect(enriched);
         }
     }
 
-    // Operator 2: Windowed aggregation - memory-intensive windowing
-    public static class WindowedAggregationFunction
-            extends ProcessWindowFunction<EnrichedEvent, AggregatedStats, String, TimeWindow> {
+    /**
+     * Simulates CPU-intensive work by performing hash iterations on the event payload.
+     * This creates back-pressure so the autoscaler has something to react to.
+     */
+    public static class CpuIntensiveFunction
+            extends RichMapFunction<EnrichedEvent, EnrichedEvent> {
+
+        private static final long serialVersionUID = 1L;
+
+        /** Number of hash rounds – keep low enough not to block checkpointing. */
+        private static final int HASH_ROUNDS = 500;
 
         @Override
-        public void process(String userId,
-                          Context context,
-                          Iterable<EnrichedEvent> elements,
-                          Collector<AggregatedStats> out) {
-            long count = 0;
-            double total = 0;
+        public EnrichedEvent map(EnrichedEvent event) {
+            // Burn a small, deterministic amount of CPU per record.
+            int hash = event.userId.hashCode();
+            for (int i = 0; i < HASH_ROUNDS; i++) {
+                hash = Integer.hashCode(hash ^ (int) event.value ^ (int) event.eventCount);
+            }
+            // Embed the hash in the tag so the work is not optimised away.
+            event.enrichmentTag = (event.enrichmentTag == null ? "" : event.enrichmentTag)
+                    + "-h" + hash;
+            return event;
+        }
+    }
 
-            for (EnrichedEvent event : elements) {
+    /**
+     * Tumbling-window aggregation that computes count / sum / min / max per user per window.
+     */
+    public static class WindowAggregationFunction
+            extends ProcessWindowFunction<EnrichedEvent, AggregatedStats, String, TimeWindow> {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public void process(
+                String userId,
+                Context context,
+                Iterable<EnrichedEvent> elements,
+                Collector<AggregatedStats> out) {
+
+            long   count = 0;
+            double sum   = 0.0;
+            double min   = Double.MAX_VALUE;
+            double max   = Double.MIN_VALUE;
+
+            for (EnrichedEvent e : elements) {
                 count++;
-                total += event.amount;
+                sum += e.value;
+                if (e.value < min) min = e.value;
+                if (e.value > max) max = e.value;
             }
 
             AggregatedStats stats = new AggregatedStats();
-            stats.userId = userId;
-            stats.eventCount = count;
-            stats.totalAmount = total;
-            stats.avgAmount = count > 0 ? total / count : 0;
+            stats.userId      = userId;
             stats.windowStart = context.window().getStart();
-            stats.windowEnd = context.window().getEnd();
+            stats.windowEnd   = context.window().getEnd();
+            stats.count       = count;
+            stats.sum         = sum;
+            stats.min         = min;
+            stats.max         = max;
 
             out.collect(stats);
         }
     }
 
-    // Operator 3: State accumulation - grows state over time (memory-intensive)
-    public static class StateAccumulationFunction
-            extends KeyedProcessFunction<String, AggregatedStats, UserProfile> {
+    /**
+     * Accumulates the last N {@link AggregatedStats} windows per user in a {@link MapState},
+     * intentionally exercising heap / managed-memory pressure so the autoscaler's memory
+     * tuning is observable.
+     */
+    public static class MemoryIntensiveAccumulatorFunction
+            extends KeyedProcessFunction<String, AggregatedStats, String> {
 
-        private transient ValueState<Long> totalEventsState;
-        private transient ValueState<Double> lifetimeValueState;
-        private transient MapState<String, Long> eventTypeCountsState;
+        private static final long serialVersionUID = 1L;
+
+        /** Maximum number of historical windows retained per user. */
+        private static final int MAX_HISTORY = 50;
+
+        private transient MapState<Long, AggregatedStats> historyState;
 
         @Override
         public void open(Configuration parameters) throws Exception {
-            totalEventsState = getRuntimeContext().getState(
-                new ValueStateDescriptor<>("totalEvents", Long.class)
-            );
-            lifetimeValueState = getRuntimeContext().getState(
-                new ValueStateDescriptor<>("lifetimeValue", Double.class)
-            );
-            eventTypeCountsState = getRuntimeContext().getMapState(
-                new MapStateDescriptor<>("eventTypeCounts", String.class, Long.class)
-            );
+            historyState = getRuntimeContext().getMapState(
+                    new MapStateDescriptor<>(
+                            "window-history",
+                            TypeInformation.of(Long.class),
+                            TypeInformation.of(new TypeHint<AggregatedStats>() {})));
         }
 
         @Override
-        public void processElement(AggregatedStats stats,
-                                  Context context,
-                                  Collector<UserProfile> out) throws Exception {
-            // Accumulate totals
-            Long currentEvents = totalEventsState.value();
-            Double currentLTV = lifetimeValueState.value();
+        public void processElement(
+                AggregatedStats stats,
+                Context ctx,
+                Collector<String> out) throws Exception {
 
-            long newTotalEvents = (currentEvents == null ? 0 : currentEvents) + stats.eventCount;
-            double newLTV = (currentLTV == null ? 0 : currentLTV) + stats.totalAmount;
+            // Store this window's result keyed by windowStart.
+            historyState.put(stats.windowStart, stats);
 
-            totalEventsState.update(newTotalEvents);
-            lifetimeValueState.update(newLTV);
+            // Prune oldest entries to cap state size.
+            List<Long> keys = new ArrayList<>();
+            historyState.keys().forEach(keys::add);
 
-            // Build profile
-            UserProfile profile = new UserProfile();
-            profile.userId = stats.userId;
-            profile.totalEvents = newTotalEvents;
-            profile.lifetimeValue = newLTV;
-
-            // Copy event type counts from state
-            for (Map.Entry<String, Long> entry : eventTypeCountsState.entries()) {
-                profile.eventTypeCounts.put(entry.getKey(), entry.getValue());
+            if (keys.size() > MAX_HISTORY) {
+                keys.sort(Long::compareTo);
+                int toRemove = keys.size() - MAX_HISTORY;
+                for (int i = 0; i < toRemove; i++) {
+                    historyState.remove(keys.get(i));
+                }
             }
 
-            out.collect(profile);
-        }
-    }
-
-    // Operator 4: Final processing
-    public static class FinalProcessingFunction extends RichMapFunction<UserProfile, String> {
-        private transient Random random;
-
-        @Override
-        public void open(Configuration parameters) throws Exception {
-            random = new Random();
-        }
-
-        @Override
-        public String map(UserProfile profile) {
-            // Simulate some processing
-            String segment = profile.lifetimeValue > 5000 ? "VIP" :
-                           profile.lifetimeValue > 1000 ? "GOLD" : "STANDARD";
-
-            return String.format("[%s] %s - Events: %d, LTV: $%.2f",
-                segment, profile.userId, profile.totalEvents, profile.lifetimeValue);
+            out.collect("User " + stats.userId + " has " + keys.size()
+                    + " windows, latest count=" + stats.count);
         }
     }
 }
