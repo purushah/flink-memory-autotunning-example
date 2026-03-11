@@ -17,13 +17,12 @@
  */
 
 package com.yahoo.flink.memory;
-
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.api.common.state.MapState;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -36,13 +35,13 @@ import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
-import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
-import java.util.HashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.Map;
 import java.util.Random;
+
 
 /**
  * Flink job demonstrating memory autotuning and autoscaling with Kubernetes Operator.
@@ -54,74 +53,79 @@ import java.util.Random;
  * 2. Stateful enrichment operator with high parallelism
  * 3. Windowed aggregation operator
  * 4. Memory-intensive state accumulation operator
- *
- * To enable autotuning in Kubernetes, configure FlinkDeployment with:
- *   job.autoscaler.enabled: true
  *   job.autoscaler.memory.tuning.enabled: true
  *   job.autoscaler.scaling.enabled: true
  */
-public class MemoryAutotuningJob {
+public final class MemoryAutotuningJob {
 
     private static final Logger LOG = LoggerFactory.getLogger(MemoryAutotuningJob.class);
 
-    // Load pattern configuration
+
     private static final long HIGH_LOAD_RATE = 100_000; // events/sec - triggers scale up
     private static final long LOW_LOAD_RATE = 500;      // events/sec - triggers scale down
-    private static final long LOAD_CYCLE_DURATION_MS = 10 * 60 * 1000; // 10 minutes per phase
+    private static final long LOAD_CYCLE_DURATION_MS =
+            TimeUnit.MINUTES.toMillis(10); // 10 minutes per phase
     private static final int USER_COUNT = 10_000; // More users = more state
 
-    public static void main(String[] args) throws Exception {
-        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    private static final long LOAD_CYCLE_DURATION_MS = 10 * 60 * 1000; // 10 minutes per phase
+    private static final int USER_COUNT = 10_000; // More users = more state
 
         // Enable checkpointing for stateful operations
         env.enableCheckpointing(60000); // Checkpoint every 60 seconds
 
-        // High default parallelism to trigger more TaskManagers under load
-        // The autoscaler will adjust this based on actual load
-        env.setParallelism(50);
+        // Let the autoscaler manage parallelism — do NOT hardcode a high default.
+        // The autoscaler will scale individual vertices up/down based on observed load.
+        // Default parallelism of 1 allows the autoscaler to start conservative.
+        env.setParallelism(1);
+
+        LOG.info("=================================================================");
+        LOG.info("Starting Variable Load Job for Autoscaling Demonstration");
 
         LOG.info("=================================================================");
         LOG.info("Starting Variable Load Job for Autoscaling Demonstration");
         LOG.info("HIGH LOAD: {} events/sec (scales up to 20-30 TaskManagers)", HIGH_LOAD_RATE);
         LOG.info("LOW LOAD: {} events/sec (scales down to 2-3 TaskManagers)", LOW_LOAD_RATE);
         LOG.info("Load cycle duration: {} minutes", LOAD_CYCLE_DURATION_MS / 60000);
-        LOG.info("=================================================================");
 
         // Generate random events with VARIABLE rates that cycle over time
+        // NOTE: The RateLimiterStrategy controls ingestion rate at the source level.
+        // VariableLoadGenerator internally adjusts event timestamps and payload
+        // to simulate load variation; true rate variation requires a custom source.
         DataGeneratorSource<Event> source = new DataGeneratorSource<>(
             new VariableLoadGenerator(),
             Long.MAX_VALUE, // Generate unlimited events
-            RateLimiterStrategy.perSecond(HIGH_LOAD_RATE), // Start with high load
+            RateLimiterStrategy.perSecond(HIGH_LOAD_RATE),
             TypeInformation.of(Event.class)
         );
+
 
         DataStream<Event> events = env.fromSource(
             source,
             WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+            source,
+            WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
                 .withTimestampAssigner((event, timestamp) -> event.timestamp),
             "VariableLoadEventSource"
-        ).setParallelism(20); // High parallelism for source
+        ); // Parallelism managed by autoscaler — no hardcoded override
 
-        // Vertex 1: Stateful enrichment - maintains state for each user
-        // HIGH PARALLELISM to utilize many TaskManagers
+        // Vertex 1: Stateful enrichment - maintains per-user keyed state.
+        // Must use process() on a KeyedStream, not map(), to access Flink keyed state correctly.
         DataStream<EnrichedEvent> enriched = events
             .keyBy(event -> event.userId)
-            .map(new StatefulEnrichmentFunction())
+            .process(new StatefulEnrichmentFunction())
             .name("StatefulEnrichment")
-            .setParallelism(80); // Very high parallelism
+            ; // Parallelism managed by autoscaler
 
-        // Vertex 2: CPU-intensive processing to create backpressure
+        // Vertex 2: CPU-intensive processing
         DataStream<EnrichedEvent> processed = enriched
             .map(new CpuIntensiveFunction())
             .name("CpuIntensiveProcessing")
-            .setParallelism(60);
+            ; // Parallelism managed by autoscaler
 
-        // Vertex 3: Windowed aggregation - memory-intensive windowing
+        // Vertex 3: Windowed aggregation — memory-intensive windowing
         DataStream<AggregatedStats> windowed = processed
             .keyBy(event -> event.userId)
-            .window(TumblingEventTimeWindows.of(Duration.ofMinutes(3)))
-            .process(new WindowedAggregationFunction())
-            .name("WindowedAggregation")
+            .window(TumblingEventTimeWindows.of(Duration.ofMinutes(
             .setParallelism(40);
 
         // Vertex 4: State accumulation - grows state over time
